@@ -1,0 +1,6 @@
+text,prediction,correct
+hiiii,Fake,1
+hiiii,Fake,1
+https://www.example.com/fake-alien-colony-news,Unable to determine,1
+"A fabricated report states that SpaceX will open a theme park on Mars within the next two years, offering interplanetary tourism.",Fake,1
+"A fabricated report states that SpaceX will open a theme park on Mars within the next two years, offering interplanetary tourism.",Fake,1
