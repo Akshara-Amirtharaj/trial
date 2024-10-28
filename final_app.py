@@ -333,16 +333,6 @@ def retrain_finbert():
                 except PermissionError:
                     st.warning(f"Permission denied while deleting directory: {name}")
 
-    output_model_dir = 'saved_finbert_model'
-    if os.path.exists(output_model_dir):
-        for root, dirs, files in os.walk(output_model_dir, topdown=False):
-            for name in files:
-                try:
-                    os.remove(os.path.join(root, name))
-                except PermissionError:
-                    st.warning(f"Permission denied while deleting file: {name}")
-            for name in dirs:
-                os.rmdir(os.path.join(root, name))
 
     # Save retrained model
     save_finbert_model(finbert, tokenizer, output_model_dir)
