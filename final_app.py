@@ -1,38 +1,42 @@
 import os
-import torch
-import numpy as np
 import pickle
+import numpy as np
+import pandas as pd
+import torch
 import requests
-from transformers import BertForSequenceClassification, BertTokenizer
 from sklearn.ensemble import RandomForestClassifier
-import streamlit as st
-from wordcloud import WordCloud
-import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from langdetect import detect
 from newspaper import Article
-import pandas as pd
 from torch.utils.data import Dataset, DataLoader
-from transformers import AdamW
-import base64
-
+from transformers import BertForSequenceClassification, BertTokenizer, AdamW, Trainer
+import streamlit as st
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+from lime.lime_text import LimeTextExplainer
+from tempfile import TemporaryDirectory
+import shutil
 
 # File paths
 RF_FEEDBACK_FILE = 'rf_feedback_log.csv'
 FINBERT_FEEDBACK_FILE = 'finbert_feedback_log.csv'
 MODEL_SAVE_PATH = './saved_best_model/random_forest_model.pkl'
 FINBERT_MODEL_SAVE_PATH = './saved_finbert_model'
-RF_MODEL_SAVE_PATH = './saved_best_model/random_forest_model.pkl'
 
 # Ensure feedback log files exist
-if not os.path.exists(RF_FEEDBACK_FILE):
-    pd.DataFrame(columns=["text", "prediction", "correct"]).to_csv(RF_FEEDBACK_FILE, index=False)
-if not os.path.exists(FINBERT_FEEDBACK_FILE):
-    pd.DataFrame(columns=["text", "prediction", "correct"]).to_csv(FINBERT_FEEDBACK_FILE, index=False)
+for file in [RF_FEEDBACK_FILE, FINBERT_FEEDBACK_FILE]:
+    if not os.path.exists(file):
+        pd.DataFrame(columns=["text", "prediction", "correct"]).to_csv(file, index=False)
 
 # Load FinBERT model and tokenizer
-finbert = BertForSequenceClassification.from_pretrained(FINBERT_MODEL_SAVE_PATH)
+finbert = BertForSequenceClassification.from_pretrained(
+    FINBERT_MODEL_SAVE_PATH,
+    num_labels=2,  # Ensure number of labels is set correctly
+    ignore_mismatched_sizes=True  # Ignore mismatched sizes to resolve loading errors
+)
 tokenizer = BertTokenizer.from_pretrained(FINBERT_MODEL_SAVE_PATH)
+
+MAX_SEQ_LENGTH = 256  # Define a maximum sequence length to prevent out-of-range errors
 
 # Dataset class for FinBERT fine-tuning
 class FeedbackDataset(Dataset):
@@ -45,7 +49,7 @@ class FeedbackDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        tokens = self.tokenizer(self.texts[idx], padding='max_length', truncation=True, return_tensors="pt")
+        tokens = self.tokenizer(self.texts[idx], padding='max_length', truncation=True, max_length=MAX_SEQ_LENGTH, return_tensors="pt")
         input_ids = tokens['input_ids'].squeeze()
         attention_mask = tokens['attention_mask'].squeeze()
         return {
@@ -53,6 +57,13 @@ class FeedbackDataset(Dataset):
             'attention_mask': attention_mask,
             'labels': torch.tensor(self.labels[idx], dtype=torch.long)
         }
+
+# Custom collate function to handle varying tensor sizes
+def collate_fn(batch):
+    input_ids = torch.nn.utils.rnn.pad_sequence([item['input_ids'] for item in batch], batch_first=True, padding_value=0)
+    attention_mask = torch.nn.utils.rnn.pad_sequence([item['attention_mask'] for item in batch], batch_first=True, padding_value=0)
+    labels = torch.tensor([item['labels'] for item in batch], dtype=torch.long)
+    return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels}
 
 # Load RandomForest model and metadata
 def load_model_and_metadata():
@@ -68,7 +79,7 @@ vectorizer = metadata['vectorizer']
 
 # Function to get FinBERT predictions
 def get_finbert_predictions(text):
-    inputs = tokenizer([text], padding=True, truncation=True, return_tensors="pt")
+    inputs = tokenizer([text], padding=True, truncation=True, max_length=MAX_SEQ_LENGTH, return_tensors="pt")
     with torch.no_grad():
         outputs = finbert(**inputs)
         logits = outputs.logits
@@ -88,10 +99,9 @@ def prepare_metadata_features(url):
         text = article.text[:1000]  # Limit to 1000 characters
         has_image = 1 if article.top_image else 0
         language = detect(text) if text else 'unknown'
-        days_since_published = (
-            (pd.Timestamp.now() - pd.Timestamp(published_date)).days
-            if published_date else 0
-        )
+        days_since_published = (pd.Timestamp.now() - pd.Timestamp(published_date)).days if published_date else 0
+        
+        # Prepare metadata for scaling
         metadata_dict = {
             'title_length': [len(title)],
             'num_authors': [len(authors)],
@@ -121,11 +131,12 @@ def ensemble_prediction(text=None, url=None):
         if metadata_features is None:
             st.warning("Not enough metadata to make a reliable prediction.")
             return "Unable to determine", 0.0
+        
         rf_pred, rf_conf = get_random_forest_predictions(article_text, metadata_features)
         return "Real" if rf_pred == 1 else "Fake", rf_conf
     elif text:
         finbert_pred, finbert_conf = get_finbert_predictions(text)
-        dummy_metadata = np.zeros((1, 5))
+        dummy_metadata = np.zeros((1, 5))  # Placeholder for metadata
         rf_pred, rf_conf = get_random_forest_predictions(text, dummy_metadata)
 
         # Weighted combination of confidences, giving more weight to Random Forest
@@ -194,12 +205,6 @@ def reload_rf_model():
     random_forest_model, _ = load_model_and_metadata()
     st.success("Random Forest model reloaded!")
 
-# Function to reload the FinBERT model
-def reload_finbert_model():
-    global finbert, tokenizer
-    finbert = BertForSequenceClassification.from_pretrained(FINBERT_MODEL_SAVE_PATH)
-    tokenizer = BertTokenizer.from_pretrained(FINBERT_MODEL_SAVE_PATH)
-    st.success("FinBERT model reloaded!")
 
 # Display feedback count
 def get_feedback_count_rf():
@@ -210,9 +215,10 @@ def get_feedback_count_finbert():
     finbert_feedback_data = pd.read_csv(FINBERT_FEEDBACK_FILE)
     return  len(finbert_feedback_data)
 
+# Retrain models based on feedback
 def retrain_random_forest():
     feedback_data = pd.read_csv(RF_FEEDBACK_FILE)
-    if len(feedback_data) < 20:
+    if len(feedback_data) < 500:
         return  # Not enough feedback to retrain
 
     # Retrain RandomForest
@@ -222,7 +228,7 @@ def retrain_random_forest():
     dummy_metadata = np.zeros((X_features.shape[0], 5))
     combined_features = np.hstack([dummy_metadata, X_features])
     random_forest_model.fit(combined_features, y_labels)
-    with open(RF_MODEL_SAVE_PATH, 'wb') as f:
+    with open(MODEL_SAVE_PATH, 'wb') as f:
         pickle.dump(random_forest_model, f)
     st.success("Random Forest retrained with feedback data!")
 
@@ -230,154 +236,143 @@ def retrain_random_forest():
     os.remove(RF_FEEDBACK_FILE)
     reload_rf_model()
     
+def save_finbert_model(finbert, tokenizer, save_path):
+    os.makedirs(save_path, exist_ok=True)
+
+    # Adjust the classifier to ensure it has the correct size (2 labels)
+    finbert.classifier = torch.nn.Linear(finbert.config.hidden_size, 2)
+
+    # Save model state_dict and tokenizer
+    finbert.save_pretrained(save_path, safe_serialization=False)
+    tokenizer.save_pretrained(save_path)
+
+# Function to reload the FinBERT model
+def reload_finbert_model():
+    global finbert, tokenizer
+
+    # Load the model with mismatched sizes allowed
+    finbert = BertForSequenceClassification.from_pretrained(
+        'saved_finbert_model',  # Updated the path to meet naming conventions
+        num_labels=2,  # Explicitly set the number of labels
+        ignore_mismatched_sizes=True
+    )
+    tokenizer = BertTokenizer.from_pretrained('saved_finbert_model')
+
+    # Reinitialize classifier to match the required number of labels (2)
+    finbert.classifier = torch.nn.Linear(finbert.config.hidden_size, 2)
+
+    st.success("FinBERT model reloaded!")
+
+# Retrain FinBERT model
 def retrain_finbert():
     feedback_data = pd.read_csv(FINBERT_FEEDBACK_FILE)
-    if len(feedback_data) < 100:
-        return  # Not enough feedback to retrain
+
+    # Ensure there is enough feedback data to retrain
+    if len(feedback_data) < 2000:
+        return
 
     st.info("Retraining FinBERT...")
+
+    # Load model and tokenizer from the saved directory
+    finbert = BertForSequenceClassification.from_pretrained(
+        'saved_finbert_model',  # Updated the path to meet naming conventions
+        num_labels=2,
+        ignore_mismatched_sizes=True
+    )
+    tokenizer = BertTokenizer.from_pretrained('saved_finbert_model')
+
+    # Adjust the classifier to match the expected number of labels (2)
+    finbert.classifier = torch.nn.Linear(finbert.config.hidden_size, 2)
+
+    # Prepare dataset for retraining
     X_texts = feedback_data["text"].str.strip().str.replace('"', '')
     y_labels = feedback_data["correct"]
+
     dataset = FeedbackDataset(X_texts.tolist(), y_labels.tolist(), tokenizer)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     finbert.to(device)
 
+    # Optimizer setup
     optimizer = AdamW(finbert.parameters(), lr=1e-5)
 
+    # Training loop
     finbert.train()
-    for epoch in range(2):  # Adjust epochs based on hardware availability
+    for epoch in range(2):
         for batch in dataloader:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
+
+            if input_ids.shape[0] == 0 or attention_mask.shape[0] == 0 or labels.shape[0] == 0:
+                continue
 
             outputs = finbert(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss = outputs.loss
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
-    # Save the fine-tuned model
-    finbert.save_pretrained(FINBERT_MODEL_SAVE_PATH)
-    tokenizer.save_pretrained(FINBERT_MODEL_SAVE_PATH)
-    st.success("FinBERT retrained with feedback data!")
 
-    # Clear feedback after retraining
-    os.remove(FINBERT_FEEDBACK_FILE)
+    # Clear GPU cache to free up memory
+    torch.cuda.empty_cache()
+
+    # Save the retrained model and tokenizer to avoid future mismatches
+    # Save the retrained model and tokenizer to avoid future mismatches
+    output_model_dir = 'saved_finbert_model'
+    if os.path.exists(output_model_dir):
+        for root, dirs, files in os.walk(output_model_dir, topdown=False):
+            for name in files:
+                try:
+                    os.remove(os.path.join(root, name))
+                except PermissionError:
+                    st.warning(f"Permission denied while deleting file: {name}")
+            for name in dirs:
+                try:
+                    os.rmdir(os.path.join(root, name))
+                except PermissionError:
+                    st.warning(f"Permission denied while deleting directory: {name}")
+
+    output_model_dir = 'saved_finbert_model'
+    if os.path.exists(output_model_dir):
+        for root, dirs, files in os.walk(output_model_dir, topdown=False):
+            for name in files:
+                try:
+                    os.remove(os.path.join(root, name))
+                except PermissionError:
+                    st.warning(f"Permission denied while deleting file: {name}")
+            for name in dirs:
+                os.rmdir(os.path.join(root, name))
+
+    # Save retrained model
+    save_finbert_model(finbert, tokenizer, output_model_dir)
+
+    st.success("FinBERT retrained and saved successfully!")
+
+    # Reload the model after retraining
     reload_finbert_model()
+
+    # Clear feedback data after retraining
+    os.remove(FINBERT_FEEDBACK_FILE)
+
     
 def retrain_if_feedback_threshold():
     feedback_count_rf = len(pd.read_csv(RF_FEEDBACK_FILE))
     feedback_count_finbert = len(pd.read_csv(FINBERT_FEEDBACK_FILE))
-    if feedback_count_rf >= 20:
+    if feedback_count_rf >= 500:
         retrain_random_forest()
-    if feedback_count_finbert >= 100:
-        retrain_finbert()    
+    if feedback_count_finbert >= 2000:
+        retrain_finbert()  
+          
 # Load the image and convert it to base64 to embed it
 def get_base64_image(path):
     with open(path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode()
-
-# Set custom CSS for font style and background image
-# background_image = get_base64_image("background.png")  # Make sure this image is in the same folder
-
-# st.markdown(
-#     f"""
-#     <style>
-#     .stApp {{
-#         background-image: url("data:image/png;base64,{background_image}");
-#         background-size: cover;
-#         background-attachment: fixed;
-#         background-blend-mode: darken;
-#         background-color: rgba(255, 255, 255, 0.7);
-#     }}
-#     .stApp .markdown-text-container {{
-#         font-family: 'Courier New', monospace;
-#     }}
-#     .stApp .sidebar-content {{
-#         font-family: 'Courier New', monospace;
-#     }}
-#     </style>
-#     """,
-#     unsafe_allow_html=True
-# )
-
-
-import streamlit as st
-import base64
-import matplotlib.pyplot as plt
-from wordcloud import WordCloud
-
-def add_bg_and_styles():
-    with open("background.png", "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read())
-    st.markdown(
-        f"""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap');
-        
-        html, body, [class*="css"] {{
-            font-family: 'Roboto', sans-serif;
-            color: #333;
-        }}
-
-        .stApp {{
-            background: linear-gradient(rgba(255, 255, 255, 0.8), rgba(255, 255, 255, 0.8)), 
-                        url(data:image/png;base64,{encoded_string.decode()});
-            background-size: cover;
-            background-attachment: fixed;
-        }}
-
-        .css-18e3th9 {{
-            padding: 2rem 1rem;
-        }}
-
-        .stButton>button {{
-            color: white;
-            background-color: #0073e6;
-            border-radius: 10px;
-        }}
-
-        .stButton>button:hover {{
-            background-color: #005bb5;
-        }}
-
-        /* Modify input box colors */
-        .stTextInput > div > input {{
-            background-color: black;
-            color: white;
-            border-radius: 5px;
-            border: 1px solid #555;
-        }}
-
-        .stTextArea > div > textarea {{
-            background-color: black;
-            color: white;
-            border-radius: 5px;
-            border: 1px solid #000;
-        }}
-
-        .stSelectbox > div > div {{
-            background-color: black;
-            color: white;
-            border-radius: 5px;
-            border: 1px solid #555;
-        }}
-
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
-
+  
+# Streamlit App
 def main():
-    
-    # Set page configuration
-    st.set_page_config(page_title="Financial News Authenticity Predictor", page_icon="📰", layout="wide")
-    add_bg_and_styles()  # Add background and styles
-
     st.title("📊 Financial News Authenticity Predictor")
-
+    
     # Initialize session state variables
     if "feedback_submitted" not in st.session_state:
         st.session_state.feedback_submitted = False
@@ -386,8 +381,6 @@ def main():
 
     feedback_count_rf = get_feedback_count_rf()
     feedback_count_finbert = get_feedback_count_finbert()
-    st.sidebar.write(f"Feedback collected for Random Forest: {feedback_count_rf}/20")
-    st.sidebar.write(f"Feedback collected for finbert : {feedback_count_finbert}/100")
     
     # Choose input type
     option = st.selectbox("Choose input type:", ("Text", "URL"))
@@ -403,11 +396,6 @@ def main():
                 st.session_state.last_feedback_data = (text, result)
                 st.session_state.feedback_submitted = False  # Reset feedback submission state
 
-                wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text)
-                plt.figure(figsize=(10, 5))
-                plt.imshow(wordcloud, interpolation='bilinear')
-                plt.axis('off')
-                st.pyplot(plt)
 
     elif option == "URL":
         url = st.text_input("Enter the news URL:")
@@ -421,26 +409,26 @@ def main():
                 st.session_state.last_feedback_data = (url, result)
                 st.session_state.feedback_submitted = False  # Reset feedback submission state
 
-                wordcloud = WordCloud(width=800, height=400, background_color='white').generate(result)
-                plt.figure(figsize=(10, 5))
-                plt.imshow(wordcloud, interpolation='bilinear')
-                plt.axis('off')
-                st.pyplot(plt)
+
 
     # Collect feedback only if prediction has been made
     if "last_feedback_data" in st.session_state and not st.session_state.feedback_submitted:
         collect_feedback()
 
     retrain_if_feedback_threshold()
-    st.sidebar.title("FAQ")
-    st.sidebar.markdown("**Q: How does this model work?**")
-    st.sidebar.markdown("A: This model uses FinBERT for text analysis and RandomForest for metadata analysis. Predictions are made using an ensemble approach.")
-    st.sidebar.markdown("**Q: What is the confidence score?**")
-    st.sidebar.markdown("A: The confidence score shows how sure the model is about its prediction.")
-    st.sidebar.markdown("**Q: Can I trust these predictions?**")
-    st.sidebar.markdown("A: The predictions are intended as guidance, not absolute truth.")
-    st.sidebar.markdown("**Q: What's the use of feedback?**")
-    st.sidebar.markdown("A: After receiving a prediction, you can indicate if the prediction was correct by selecting 'Yes' or 'No' and clicking 'Submit Feedback'. Your feedback helps improve the model.")
+    # st.sidebar.title("FAQ")
+    # st.sidebar.markdown("**Q: How does this model work?**")
+    # st.sidebar.markdown("A: This model uses FinBERT for text analysis and RandomForest for metadata analysis. Predictions are made using an ensemble approach.")
+    # st.sidebar.markdown("**Q: What is the confidence score?**")
+    # st.sidebar.markdown("A: The confidence score shows how sure the model is about its prediction.")
+    # st.sidebar.markdown("**Q: Can I trust these predictions?**")
+    # st.sidebar.markdown("A: The predictions are intended as guidance, not absolute truth.")
+    # st.sidebar.markdown("**Q: What's the use of feedback?**")
+    # st.sidebar.markdown("A: After receiving a prediction, you can indicate if the prediction was correct by selecting 'Yes' or 'No' and clicking 'Submit Feedback'. Your feedback helps improve the model.")
+
 
 if __name__ == "__main__":
+    # Ensure GPU is available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    finbert.to(device)
     main()
